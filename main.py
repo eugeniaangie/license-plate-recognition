@@ -1,389 +1,342 @@
+from paddleocr import PaddleOCR
+from preprocess import preprocess_plate, check_image_quality
+from postprocess import post_process_plate, validate_format, confidence_score
+from ultralytics import YOLO
 import cv2
 import numpy as np
-import easyocr
-import re
+from collections import Counter
 import matplotlib.pyplot as plt
-from ultralytics import YOLO
+import sys
 
-class LicensePlateOCR:
-    def __init__(self, model_path="./plate_detection_bestv1.pt"):
-        """Initialize the license plate detection and OCR system"""
-        self.model = YOLO(model_path)
-        self.reader = easyocr.Reader(['en'], gpu=False)
-        
-        # Character correction mappings (based on common OCR errors)
-        self.dict_char_to_int = {
-            'O': '0', 'o': '0',
-            'I': '1', 'l': '1', '|': '1',
-            'Z': '2', 'z': '2',
-            'J': '3', 'j': '3',
-            'A': '4', 'a': '4',
-            'S': '5', 's': '5',
-            'G': '6', 'g': '6',
-            'T': '7', 't': '7',
-            'B': '8', 'b': '8',
-            'g': '9', 'q': '9'
-        }
-        
-        self.dict_int_to_char = {
-            '0': 'O',
-            '1': 'I',
-            '2': 'Z',
-            '3': 'J',
-            '4': 'A',
-            '5': 'S',
-            '6': 'G',
-            '7': 'T',
-            '8': 'B'
-        }
+# Initialize models
+print("🔧 Loading models...")
+yolo_model = YOLO("plate_detection_bestv1.pt")
+# PaddleOCR with adjusted parameters for better small text detection
+ocr = PaddleOCR(
+    lang='en',
+    det_db_thresh=0.2,  # Lower threshold (default 0.3) - detect more text
+    det_db_box_thresh=0.4,  # Lower box threshold (default 0.6) - keep smaller boxes
+    rec_batch_num=1  # Process one at a time for better accuracy
+)
+print("✅ Models loaded!\n")
 
-    def detect_license_plates(self, image):
-        """Detect license plates in the image"""
-        results = self.model(image)[0]
-        detections = []
-        
+def detect_plates(image):
+    """Detect license plates using YOLOv10"""
+    results = yolo_model(image, verbose=False)[0]
+    
+    plates = []
+    if results.boxes is not None:
         for box in results.boxes:
             x1, y1, x2, y2 = map(int, box.xyxy[0])
             confidence = float(box.conf[0])
-            detections.append({
-                'bbox': [x1, y1, x2, y2],
-                'confidence': confidence
-            })
-        
-        return detections, results
+            
+            plate_img = image[y1:y2, x1:x2]
+            
+            if plate_img.size > 0:
+                plates.append({
+                    'image': plate_img,
+                    'bbox': (x1, y1, x2, y2),
+                    'confidence': confidence
+                })
+    
+    return plates
 
-    def preprocess_license_plate(self, crop):
-        """Advanced preprocessing for better OCR results"""
-        # Convert to grayscale
-        if len(crop.shape) == 3:
-            gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-        else:
-            gray = crop.copy()
+def ocr_with_paddleocr(processed_img):
+    """Run PaddleOCR on processed image"""
+    try:
+        # Convert grayscale to BGR if needed
+        if len(processed_img.shape) == 2:
+            processed_img = cv2.cvtColor(processed_img, cv2.COLOR_GRAY2BGR)
         
-        # Resize to improve OCR accuracy
-        height, width = gray.shape
-        if height < 50:
-            scale_factor = 50 / height
-            new_width = int(width * scale_factor)
-            gray = cv2.resize(gray, (new_width, 50), interpolation=cv2.INTER_CUBIC)
+        # PaddleOCR predict returns a list with dict
+        result = ocr.predict(processed_img)
         
-        # Apply Gaussian blur to reduce noise
-        blurred = cv2.GaussianBlur(gray, (3, 3), 0)
-        
-        # Apply CLAHE (Contrast Limited Adaptive Histogram Equalization)
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
-        enhanced = clahe.apply(blurred)
-        
-        # Multiple thresholding approaches
-        preprocessed_images = []
-        
-        # 1. Adaptive threshold
-        adaptive = cv2.adaptiveThreshold(enhanced, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-                                       cv2.THRESH_BINARY, 11, 2)
-        preprocessed_images.append(("Adaptive Threshold", adaptive))
-        
-        # 2. Otsu's threshold
-        _, otsu = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        preprocessed_images.append(("Otsu Threshold", otsu))
-        
-        # 3. Binary threshold with different values
-        for thresh_val in [64, 128, 180]:
-            _, binary = cv2.threshold(enhanced, thresh_val, 255, cv2.THRESH_BINARY)
-            preprocessed_images.append((f"Binary {thresh_val}", binary))
+        if result and isinstance(result, list) and len(result) > 0:
+            res_dict = result[0]
             
-            _, binary_inv = cv2.threshold(enhanced, thresh_val, 255, cv2.THRESH_BINARY_INV)
-            preprocessed_images.append((f"Binary INV {thresh_val}", binary_inv))
-        
-        # 4. Morphological operations
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
-        morph = cv2.morphologyEx(adaptive, cv2.MORPH_CLOSE, kernel)
-        preprocessed_images.append(("Morphological", morph))
-        
-        return preprocessed_images
-
-    def license_complies_format(self, text, format_type="indonesia"):
-        """Check if license plate text complies with Indonesian format"""
-        if format_type == "indonesia":
-            # Indonesian format examples:
-            # - D 1078 ALF (1 huruf + 4 angka + 3 huruf) 
-            # - B 1234 CD (1 huruf + 4 angka + 2 huruf)
-            # - AA 123 B (2 huruf + 3 angka + 1 huruf)
-            # - Jakarta: B 1234 ABC, D 5678 EFG
-            # - Regional: AA 1234 BB, etc.
-            
-            text_clean = text.replace(' ', '').upper()
-            if len(text_clean) < 4 or len(text_clean) > 10:
-                return False
-            
-            # Indonesian license plate pattern
-            # Pattern: 1-3 huruf + 1-4 angka + 1-3 huruf
-            pattern = r'^[A-Z]{1,3}[0-9]{1,4}[A-Z]{1,3}$'
-            
-            # Additional validation untuk kode wilayah Indonesia
-            valid_prefixes = [
-                'A', 'B', 'D', 'E', 'F', 'G', 'H', 'K', 'L', 'M', 'N', 'P', 'R', 'S', 'T', 'W', 'Z',
-                'AA', 'AB', 'AD', 'AE', 'AG', 'BA', 'BB', 'BD', 'BE', 'BG', 'BH', 'BK', 'BL', 'BM', 'BN',
-                'BP', 'BR', 'BS', 'BT', 'CC', 'CD', 'CE', 'CG', 'DA', 'DB', 'DD', 'DE', 'DG', 'DH', 'DK',
-                'DL', 'DM', 'DN', 'DP', 'DR', 'DS', 'DT', 'EA', 'EB', 'ED', 'EE', 'EF', 'EG', 'EH', 'EK'
-            ]
-            
-            if re.match(pattern, text_clean):
-                # Check if starts with valid Indonesian region code
-                for prefix in valid_prefixes:
-                    if text_clean.startswith(prefix):
-                        return True
-                # If no specific prefix match, still accept if follows general pattern
-                return True
-            
-            return False
-        
-        return False
-
-    def format_license(self, text):
-        """Format and correct OCR errors in Indonesian license plate text"""
-        text = text.upper().replace(' ', '').replace('"', '').replace("'", '')
-        
-        # Remove common OCR artifacts
-        artifacts = ['(', ')', '[', ']', '{', '}', '-', '_', '/', '\\', '|', '.', ',']
-        for artifact in artifacts:
-            text = text.replace(artifact, '')
-        
-        # Apply character corrections based on Indonesian plate structure
-        corrected = ''
-        for i, char in enumerate(text):
-            # Indonesian plates: huruf di awal dan akhir, angka di tengah
-            
-            # Deteksi posisi berdasarkan pola Indonesia
-            is_in_region_code = i < 3 and (i == 0 or text[i-1].isalpha())
-            is_in_number_part = False
-            is_in_suffix_code = False
-            
-            # Cari dimana angka mulai dan berakhir
-            number_start = -1
-            number_end = -1
-            for j, c in enumerate(text):
-                if c.isdigit():
-                    if number_start == -1:
-                        number_start = j
-                    number_end = j + 1
-            
-            if number_start != -1 and number_end != -1:
-                is_in_number_part = number_start <= i < number_end
-                is_in_suffix_code = i >= number_end
-            
-            # Apply corrections based on position
-            if is_in_region_code or is_in_suffix_code:
-                # Posisi huruf: angka -> huruf
-                if char in self.dict_int_to_char:
-                    corrected += self.dict_int_to_char[char]
-                elif char in self.dict_char_to_int.keys() and char.isalpha():
-                    corrected += char  # Keep original letter
-                else:
-                    corrected += char
-            elif is_in_number_part:
-                # Posisi angka: huruf -> angka
-                if char in self.dict_char_to_int:
-                    corrected += self.dict_char_to_int[char]
-                else:
-                    corrected += char
-            else:
-                corrected += char
-        
-        # Format dengan spasi sesuai standar Indonesia: X XXXX XXX atau XX XXXX XX
-        if len(corrected) >= 4:
-            # Cari akhir kode wilayah (huruf awal)
-            region_code_end = 0
-            for i, char in enumerate(corrected):
-                if char.isalpha():
-                    region_code_end = i + 1
-                else:
-                    break
-            
-            # Cari akhir nomor (angka)
-            number_end = region_code_end
-            for i in range(region_code_end, len(corrected)):
-                if corrected[i].isdigit():
-                    number_end = i + 1
-                else:
-                    break
-            
-            if region_code_end > 0 and number_end > region_code_end:
-                # Format: [KODE WILAYAH] [NOMOR] [KODE AKHIRAN]
-                formatted = corrected[:region_code_end] + ' ' + corrected[region_code_end:number_end]
-                if number_end < len(corrected):
-                    formatted += ' ' + corrected[number_end:]
-                return formatted
-        
-        return corrected
-
-    def read_license_plate(self, crop_images):
-        """Read license plate text from preprocessed images"""
-        best_result = None
-        best_score = 0
-        all_results = []
-        
-        for method_name, processed_img in crop_images:
-            try:
-                detections = self.reader.readtext(processed_img)
+            # Extract rec_texts and rec_scores
+            if 'rec_texts' in res_dict and res_dict['rec_texts']:
+                texts = res_dict['rec_texts']
+                scores = res_dict.get('rec_scores', [])
                 
-                for detection in detections:
-                    bbox, text, confidence = detection
+                # Sort texts by position (left to right) if dt_polys available
+                if 'dt_polys' in res_dict and res_dict['dt_polys']:
+                    polys = res_dict['dt_polys']
+                    # Sort by x-coordinate (leftmost first)
+                    text_with_pos = [(texts[i], scores[i], polys[i][0][0]) for i in range(len(texts))]
+                    text_with_pos.sort(key=lambda x: x[2])  # Sort by x position
+                    texts = [t[0] for t in text_with_pos]
+                    scores = [t[1] for t in text_with_pos]
+                
+                # Combine all text (in order)
+                raw_text = ''.join(texts) if isinstance(texts, list) else str(texts)
+                avg_confidence = float(np.mean(scores)) if scores and len(scores) > 0 else 0.8
+                
+                return raw_text, avg_confidence
+        
+        return None, 0.0
+        
+    except Exception as e:
+        return None, 0.0
+
+def recognize_plate_with_voting(plate_img, num_attempts=3):
+    """
+    Full pipeline with voting mechanism:
+    1. Quality check
+    2. Preprocessing (4 variations)
+    3. OCR multiple times
+    4. Post-processing
+    5. Voting for best result
+    """
+    
+    # 1. Quality check
+    is_ok, blur_score, brightness = check_image_quality(plate_img, blur_threshold=50.0)
+    
+    print(f"  📊 Quality: Blur={blur_score:.1f}, Brightness={brightness:.1f}")
+    
+    if not is_ok:
+        print(f"  ⚠️  Image quality too low")
+        return None, 0.0, [], []
+    
+    # 2. Preprocessing
+    print(f"  🔄 Preprocessing with 5 methods...")
+    processed_images = preprocess_plate(plate_img)
+    
+    # 3. OCR with voting
+    all_results = []
+    
+    print(f"  🔍 Running OCR with voting...")
+    for attempt in range(num_attempts):
+        for i, processed in enumerate(processed_images):
+            raw_text, ocr_conf = ocr_with_paddleocr(processed)
+            
+            if raw_text:
+                print(f"  🔍 Raw text: {raw_text}")
+                cleaned_text = post_process_plate(raw_text)
+                
+                if cleaned_text:
+                    is_valid, area, number, suffix = validate_format(cleaned_text)
+                    format_score = confidence_score(cleaned_text)
                     
-                    # Clean and format text
-                    formatted_text = self.format_license(text)
+                    # Combine OCR confidence (0-1) with format score (0-100)
+                    # Weight: 70% OCR confidence, 30% format validation
+                    combined_confidence = (ocr_conf * 70) + (format_score * 0.3)
                     
                     result = {
-                        'method': method_name,
-                        'raw_text': text,
-                        'formatted_text': formatted_text,
-                        'confidence': confidence,
-                        'complies_format': self.license_complies_format(formatted_text)
+                        'raw': raw_text,
+                        'cleaned': cleaned_text,
+                        'ocr_confidence': ocr_conf,
+                        'format_valid': is_valid,
+                        'confidence_score': combined_confidence,
+                        'method': f"v{i}_attempt{attempt+1}"
                     }
-                    
                     all_results.append(result)
-                    
-                    # Prioritize results that comply with format and have good confidence
-                    score = confidence
-                    if result['complies_format']:
-                        score *= 1.5  # Boost score for valid format
-                    
-                    if score > best_score:
-                        best_score = score
-                        best_result = result
-                        
-            except Exception as e:
-                print(f"Error processing {method_name}: {e}")
-        
-        return best_result, all_results
-
-    def visualize_results(self, image, detections, results_data):
-        """Visualize detection and OCR results"""
-        # Create figure for visualization
-        plt.figure(figsize=(20, 12))
-        
-        # Show original image with detections
-        plt.subplot(2, 4, 1)
-        img_with_boxes = image.copy()
-        for i, detection in enumerate(detections):
-            x1, y1, x2, y2 = detection['bbox']
-            cv2.rectangle(img_with_boxes, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            cv2.putText(img_with_boxes, f"Plate {i+1}", (x1, y1-10), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-        
-        plt.imshow(cv2.cvtColor(img_with_boxes, cv2.COLOR_BGR2RGB))
-        plt.title('License Plate Detection')
-        plt.axis('off')
-        
-        # Show cropped plates and preprocessing results
-        plot_idx = 2
-        for i, (detection, result_data) in enumerate(zip(detections, results_data)):
-            if plot_idx > 8:
-                break
-                
-            x1, y1, x2, y2 = detection['bbox']
-            crop = image[y1:y2, x1:x2]
-            
-            # Original crop
-            plt.subplot(2, 4, plot_idx)
-            plt.imshow(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
-            plt.title(f'Plate {i+1} Original')
-            plt.axis('off')
-            plot_idx += 1
-            
-            if plot_idx <= 8 and result_data['best_result']:
-                # Best preprocessing result
-                best_method = result_data['best_result']['method']
-                preprocessed_images = result_data['preprocessed_images']
-                
-                for method_name, processed_img in preprocessed_images:
-                    if method_name == best_method:
-                        plt.subplot(2, 4, plot_idx)
-                        plt.imshow(processed_img, cmap='gray')
-                        plt.title(f'Best: {best_method}')
-                        plt.axis('off')
-                        plot_idx += 1
-                        break
-        
-        plt.tight_layout()
-        plt.show()
-
-    def process_image(self, image_path, visualize=True):
-        """Complete pipeline for license plate detection and OCR"""
-        # Load image
-        image = cv2.imread(image_path)
-        if image is None:
-            raise ValueError(f"Could not load image from {image_path}")
-        
-        print(f"Processing image: {image_path}")
-        print(f"Image shape: {image.shape}")
-        
-        # Detect license plates
-        detections, yolo_results = self.detect_license_plates(image)
-        print(f"Found {len(detections)} license plate(s)")
-        
-        results_data = []
-        
-        for i, detection in enumerate(detections):
-            print(f"\n--- Processing Plate {i+1} ---")
-            x1, y1, x2, y2 = detection['bbox']
-            crop = image[y1:y2, x1:x2]
-            
-            # Preprocess the crop
-            preprocessed_images = self.preprocess_license_plate(crop)
-            
-            # Perform OCR
-            best_result, all_results = self.read_license_plate(preprocessed_images)
-            
-            result_data = {
-                'detection': detection,
-                'crop': crop,
-                'preprocessed_images': preprocessed_images,
-                'best_result': best_result,
-                'all_results': all_results
-            }
-            results_data.append(result_data)
-            
-            # Print results
-            if best_result:
-                print(f"Best Result:")
-                print(f"  Method: {best_result['method']}")
-                print(f"  Raw Text: '{best_result['raw_text']}'")
-                print(f"  Formatted: '{best_result['formatted_text']}'")
-                print(f"  Confidence: {best_result['confidence']:.3f}")
-                print(f"  Valid Format: {best_result['complies_format']}")
-            else:
-                print("No valid text detected")
-            
-            print(f"\nAll OCR attempts for Plate {i+1}:")
-            for result in all_results:
-                print(f"  {result['method']}: '{result['formatted_text']}' (conf: {result['confidence']:.3f}, valid: {result['complies_format']})")
-        
-        # Visualize results
-        if visualize:
-            self.visualize_results(image, detections, results_data)
-        
-        return results_data
-
-# Usage example
-if __name__ == "__main__":
-    # Initialize the system
-    ocr_system = LicensePlateOCR("./plate_detection_bestv1.pt")
     
-    # Process an image
-    try:
-        results = ocr_system.process_image("car.jpg", visualize=True)
+    if not all_results:
+        print(f"  ❌ No valid OCR results")
+        return None, 0.0, [], processed_images
+    
+    # 4. Voting
+    cleaned_texts = [r['cleaned'] for r in all_results]
+    text_counts = Counter(cleaned_texts)
+    most_common = text_counts.most_common(3)
+    
+    print(f"  🗳️  Voting results:")
+    for text, count in most_common:
+        print(f"      '{text}': {count} votes")
+    
+    # 5. Select best
+    best_text = most_common[0][0]
+    best_results = [r for r in all_results if r['cleaned'] == best_text]
+    best_result = max(best_results, key=lambda x: x['confidence_score'])
+    
+    return best_result['cleaned'], best_result['confidence_score'], all_results, processed_images
+
+def visualize_results(image, plates_data, output_path='result.png'):
+    """Create visualization with detection and OCR results"""
+    fig = plt.figure(figsize=(20, 12))
+    
+    # Original image with bbox
+    plt.subplot(2, 4, 1)
+    img_with_boxes = image.copy()
+    for i, data in enumerate(plates_data):
+        x1, y1, x2, y2 = data['bbox']
+        cv2.rectangle(img_with_boxes, (x1, y1), (x2, y2), (0, 255, 0), 3)
         
-        # Print final summary
-        print("\n=== FINAL RESULTS ===")
-        for i, result in enumerate(results):
-            print(f"License Plate {i+1}:")
-            if result['best_result']:
-                print(f"  Text: {result['best_result']['formatted_text']}")
-                print(f"  Confidence: {result['best_result']['confidence']:.3f}")
-                print(f"  Valid: {result['best_result']['complies_format']}")
-            else:
-                print("  No valid text detected")
-            print()
+        if data['plate_text']:
+            label = f"Plate {i+1}: {data['plate_text']}"
+            cv2.putText(img_with_boxes, label, (x1, y1-10), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+    
+    plt.imshow(cv2.cvtColor(img_with_boxes, cv2.COLOR_BGR2RGB))
+    plt.title('License Plate Detection', fontsize=14, fontweight='bold')
+    plt.axis('off')
+    
+    # Process each plate
+    plot_idx = 2
+    for i, data in enumerate(plates_data):
+        if plot_idx > 8:
+            break
+        
+        # Cropped plate
+        plt.subplot(2, 4, plot_idx)
+        plt.imshow(cv2.cvtColor(data['plate_img'], cv2.COLOR_BGR2RGB))
+        title = f"Plate {i+1} - Original Crop"
+        if data['plate_text']:
+            title = f"Plate {i+1}\n{data['plate_text']}"
+        plt.title(title, fontsize=12, fontweight='bold')
+        plt.axis('off')
+        plot_idx += 1
+        
+        # Show preprocessed versions (max 3)
+        if data['processed_images']:
+            for j, processed in enumerate(data['processed_images'][:3]):
+                if plot_idx > 8:
+                    break
+                
+                plt.subplot(2, 4, plot_idx)
+                plt.imshow(processed, cmap='gray')
+                plt.title(f'Preprocess v{j}', fontsize=11)
+                plt.axis('off')
+                plot_idx += 1
+    
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    print(f"\n💾 Saved visualization: {output_path}")
+    plt.close()
+
+def process_image(image_path, visualize=True):
+    """
+    Complete pipeline for single image:
+    1. Load image
+    2. Detect plates with YOLO
+    3. OCR each plate with voting
+    4. Visualize results
+    """
+    print(f"\n{'='*60}")
+    print(f"📸 Processing: {image_path}")
+    print(f"{'='*60}")
+    
+    # Load image
+    img = cv2.imread(image_path)
+    if img is None:
+        print(f"❌ Cannot load image: {image_path}")
+        return None
+    
+    print(f"📐 Image size: {img.shape[1]}x{img.shape[0]}")
+    
+    # Detect plates
+    print(f"\n🎯 Detecting license plates...")
+    plates = detect_plates(img)
+    print(f"✅ Found {len(plates)} plate(s)")
+    
+    if len(plates) == 0:
+        print("❌ No license plates detected")
+        return None
+    
+    # Process each plate
+    plates_data = []
+    for i, plate_data in enumerate(plates):
+        print(f"\n{'─'*60}")
+        print(f"🔖 Plate #{i+1}")
+        print(f"  Detection confidence: {plate_data['confidence']:.3f}")
+        
+        plate_img = plate_data['image']
+        print(f"  Plate size: {plate_img.shape[1]}x{plate_img.shape[0]}")
+        
+        # OCR with voting
+        plate_text, confidence, all_results, processed_images = recognize_plate_with_voting(plate_img)
+        
+        if plate_text:
+            print(f"\n  ✅ RESULT: {plate_text}")
+            print(f"  📊 Confidence: {confidence:.1f}/100")
             
-    except Exception as e:
-        print(f"Error: {e}")
+            # Validate
+            is_valid, area, number, suffix = validate_format(plate_text)
+            if is_valid:
+                print(f"  ✓ Format: VALID")
+                print(f"    Area: {area} | Number: {number} | Suffix: {suffix}")
+            else:
+                print(f"  ⚠ Format: INVALID")
+                # Check if missing area code
+                if plate_text and plate_text[0].isdigit():
+                    print(f"  ⚠️  WARNING: Missing area code (starts with number)")
+                    print(f"      Detected: {plate_text}")
+                    print(f"      Possible: D{plate_text}, B{plate_text}, etc.")
+        else:
+            print(f"\n  ❌ Could not recognize plate")
+        
+        plates_data.append({
+            'bbox': plate_data['bbox'],
+            'plate_img': plate_img,
+            'plate_text': plate_text,
+            'confidence': confidence,
+            'processed_images': processed_images,
+            'all_results': all_results
+        })
+    
+    # Visualize
+    if visualize:
+        print(f"\n{'='*60}")
+        print("📊 Creating visualization...")
+        output_path = 'result.png'  # Always overwrite to result.png
+        visualize_results(img, plates_data, output_path)
+    
+    # Return results
+    result = {
+        'image_path': image_path,
+        'plates': [{'text': p['plate_text'], 'confidence': p['confidence']} 
+                   for p in plates_data if p['plate_text']]
+    }
+    
+    return result
+
+def main():
+    """Main function"""
+    print("\n" + "="*60)
+    print("🚗 INDONESIAN LICENSE PLATE RECOGNITION SYSTEM")
+    print("🔬 Using: YOLOv10 + PaddleOCR + Voting Mechanism")
+    print("="*60)
+    
+    # Get image paths from command line or use default
+    if len(sys.argv) > 1:
+        test_images = sys.argv[1:]
+    else:
+        test_images = ["car.jpg"]  # Default
+    
+    print(f"\n📋 Processing {len(test_images)} image(s)...")
+    
+    # Process each image
+    all_results = []
+    for img_path in test_images:
+        try:
+            result = process_image(img_path, visualize=True)
+            if result:
+                all_results.append(result)
+        except FileNotFoundError:
+            print(f"\n⚠️  Image not found: {img_path}")
+        except Exception as e:
+            print(f"\n❌ Error processing {img_path}: {e}")
+    
+    # Summary
+    if len(all_results) > 0:
+        print("\n" + "="*60)
+        print("📊 SUMMARY")
+        print("="*60)
+        
+        total_plates = sum(len(r['plates']) for r in all_results)
+        print(f"Images processed: {len(all_results)}")
+        print(f"Total plates recognized: {total_plates}")
+        
+        print("\n🎯 Results:")
+        for result in all_results:
+            img_name = result['image_path']
+            for plate in result['plates']:
+                print(f"  {img_name}: {plate['text']} ({plate['confidence']:.0f}%)")
+    
+    print("\n" + "="*60)
+    print("✅ Processing complete!")
+    print("="*60)
+
+if __name__ == "__main__":
+    main()
