@@ -142,7 +142,7 @@ def preprocess_plate_v0(img):
     """
     # Only remove date section, no border removal
     h = img.shape[0]
-    no_date = img[0:int(h*0.75), :]
+    no_date = img[0:int(h*0.65), :]
     
     # Resize 3x for better OCR
     img_large = cv2.resize(no_date, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
@@ -171,7 +171,7 @@ def preprocess_plate_raw(img):
     """
     # Only remove date section
     h = img.shape[0]
-    no_date = img[0:int(h*0.75), :]
+    no_date = img[0:int(h*0.65), :]
     
     # Resize 4x for maximum clarity
     img_large = cv2.resize(no_date, None, fx=4, fy=4, interpolation=cv2.INTER_CUBIC)
