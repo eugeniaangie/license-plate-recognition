@@ -142,7 +142,7 @@ def preprocess_plate_v0(img):
     """
     # Only remove date section, no border removal
     h = img.shape[0]
-    no_date = img[0:int(h*0.65), :]
+    no_date = img[0:int(h*0.70), :]
     
     # Resize 3x for better OCR
     img_large = cv2.resize(no_date, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
@@ -171,7 +171,7 @@ def preprocess_plate_raw(img):
     """
     # Only remove date section
     h = img.shape[0]
-    no_date = img[0:int(h*0.65), :]
+    no_date = img[0:int(h*0.70), :]
     
     # Resize 4x for maximum clarity
     img_large = cv2.resize(no_date, None, fx=4, fy=4, interpolation=cv2.INTER_CUBIC)
@@ -185,7 +185,7 @@ def preprocess_plate_raw(img):
 def preprocess_plate(img):
     """
     Main preprocessing pipeline dengan 5 variations (added raw + v0)
-    Return: list of preprocessed images untuk voting
+    Return: list of dicts with method name and preprocessed image
     """
     # Version RAW: Almost original (best for separated chars)
     processed_raw = preprocess_plate_raw(img)
@@ -198,11 +198,11 @@ def preprocess_plate(img):
     no_date = remove_date_section(no_border, keep_ratio=0.70)
     
     processed_images = [
-        processed_raw,  # Try raw first
-        processed_v0,   # Then minimal
-        preprocess_plate_v1(no_date),
-        preprocess_plate_v2(no_date),
-        preprocess_plate_v3(no_date)
+        # {'method': 'raw', 'image': processed_raw},
+        # {'method': 'v0', 'image': processed_v0},
+        {'method': 'v1', 'image': preprocess_plate_v1(no_date)},
+        {'method': 'v2', 'image': preprocess_plate_v2(no_date)},
+        {'method': 'v3', 'image': preprocess_plate_v3(no_date)}
     ]
     
     return processed_images

@@ -1,4 +1,6 @@
 from paddleocr import PaddleOCR
+import easyocr
+import pytesseract
 from preprocess import preprocess_plate, check_image_quality
 from postprocess import post_process_plate, validate_format, confidence_score
 from ultralytics import YOLO
@@ -8,16 +10,22 @@ from collections import Counter
 import matplotlib.pyplot as plt
 import sys
 
+# Using 3 stable OCR engines only
+
 # Initialize models
 print("🔧 Loading models...")
 yolo_model = YOLO("plate_detection_bestv1.pt")
 # PaddleOCR with adjusted parameters for better small text detection
-ocr = PaddleOCR(
+paddle_ocr = PaddleOCR(
     lang='en',
     det_db_thresh=0.2,  # Lower threshold (default 0.3) - detect more text
     det_db_box_thresh=0.4,  # Lower box threshold (default 0.6) - keep smaller boxes
     rec_batch_num=1  # Process one at a time for better accuracy
 )
+# EasyOCR for better single character detection
+easy_ocr = easyocr.Reader(['en'], gpu=False)
+# Tesseract OCR - classic but reliable
+
 print("✅ Models loaded!\n")
 
 def detect_plates(image):
@@ -49,7 +57,7 @@ def ocr_with_paddleocr(processed_img):
             processed_img = cv2.cvtColor(processed_img, cv2.COLOR_GRAY2BGR)
         
         # PaddleOCR predict returns a list with dict
-        result = ocr.predict(processed_img)
+        result = paddle_ocr.predict(processed_img)
         
         if result and isinstance(result, list) and len(result) > 0:
             res_dict = result[0]
@@ -79,6 +87,68 @@ def ocr_with_paddleocr(processed_img):
     except Exception as e:
         return None, 0.0
 
+def ocr_with_easyocr(processed_img):
+    """Run EasyOCR on processed image"""
+    try:
+        # Convert grayscale to BGR if needed
+        if len(processed_img.shape) == 2:
+            processed_img = cv2.cvtColor(processed_img, cv2.COLOR_GRAY2BGR)
+        
+        # EasyOCR readtext
+        result = easy_ocr.readtext(processed_img)
+        
+        if result:
+            # Extract texts and confidences
+            texts = []
+            confidences = []
+            for (bbox, text, conf) in result:
+                texts.append(text)
+                confidences.append(conf)
+            
+            # Sort by x-coordinate (leftmost first)
+            if len(result) > 1:
+                # Sort by bbox x-coordinate
+                text_with_pos = [(texts[i], confidences[i], result[i][0][0][0]) for i in range(len(texts))]
+                text_with_pos.sort(key=lambda x: x[2])  # Sort by x position
+                texts = [t[0] for t in text_with_pos]
+                confidences = [t[1] for t in text_with_pos]
+            
+            # Combine all text
+            raw_text = ''.join(texts) if texts else ""
+            avg_confidence = float(np.mean(confidences)) if confidences else 0.0
+            
+            return raw_text, avg_confidence
+        
+        return None, 0.0
+        
+    except Exception as e:
+        return None, 0.0
+
+def ocr_with_tesseract(processed_img):
+    """Run Tesseract OCR on processed image"""
+    try:
+        # Convert grayscale to BGR if needed
+        if len(processed_img.shape) == 2:
+            processed_img = cv2.cvtColor(processed_img, cv2.COLOR_GRAY2BGR)
+        
+        # Tesseract OCR with custom config for license plates
+        custom_config = r'--oem 3 --psm 8 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
+        text = pytesseract.image_to_string(processed_img, config=custom_config)
+        
+        # Get confidence data
+        data = pytesseract.image_to_data(processed_img, config=custom_config, output_type=pytesseract.Output.DICT)
+        confidences = [int(conf) for conf in data['conf'] if int(conf) > 0]
+        avg_confidence = float(np.mean(confidences)) / 100.0 if confidences else 0.0
+        
+        # Clean text
+        text = text.strip().replace('\n', '').replace(' ', '')
+        
+        return text if text else None, avg_confidence
+        
+    except Exception as e:
+        return None, 0.0
+
+
 def recognize_plate_with_voting(plate_img, num_attempts=3):
     """
     Full pipeline with voting mechanism:
@@ -105,32 +175,45 @@ def recognize_plate_with_voting(plate_img, num_attempts=3):
     # 3. OCR with voting
     all_results = []
     
-    print(f"  🔍 Running OCR with voting...")
+    # 3 stable OCR engines
+    available_engines = [
+        ('PaddleOCR', ocr_with_paddleocr),
+        ('EasyOCR', ocr_with_easyocr),
+        ('Tesseract', ocr_with_tesseract)
+    ]
+    
+    print(f"  🔍 Running OCR with voting (3 engines: PaddleOCR + EasyOCR + Tesseract)...")
+    
     for attempt in range(num_attempts):
-        for i, processed in enumerate(processed_images):
-            raw_text, ocr_conf = ocr_with_paddleocr(processed)
+        for item in processed_images:
+            processed = item['image']
+            method = item['method']
             
-            if raw_text:
-                print(f"  🔍 Raw text: {raw_text}")
-                cleaned_text = post_process_plate(raw_text)
+            # Try all available OCR engines
+            for engine_name, ocr_func in available_engines:
+                raw_text, ocr_conf = ocr_func(processed)
                 
-                if cleaned_text:
-                    is_valid, area, number, suffix = validate_format(cleaned_text)
-                    format_score = confidence_score(cleaned_text)
+                if raw_text:
+                    print(f"  🔍 [{engine_name}-{method}] Raw text: {raw_text}")
+                    cleaned_text = post_process_plate(raw_text)
                     
-                    # Combine OCR confidence (0-1) with format score (0-100)
-                    # Weight: 70% OCR confidence, 30% format validation
-                    combined_confidence = (ocr_conf * 70) + (format_score * 0.3)
-                    
-                    result = {
-                        'raw': raw_text,
-                        'cleaned': cleaned_text,
-                        'ocr_confidence': ocr_conf,
-                        'format_valid': is_valid,
-                        'confidence_score': combined_confidence,
-                        'method': f"v{i}_attempt{attempt+1}"
-                    }
-                    all_results.append(result)
+                    if cleaned_text:
+                        is_valid, area, number, suffix = validate_format(cleaned_text)
+                        format_score = confidence_score(cleaned_text)
+                        
+                        # Combine OCR confidence (0-1) with format score (0-100)
+                        # Weight: 70% OCR confidence, 30% format validation
+                        combined_confidence = (ocr_conf * 70) + (format_score * 0.3)
+                        
+                        result = {
+                            'raw': raw_text,
+                            'cleaned': cleaned_text,
+                            'ocr_confidence': ocr_conf,
+                            'format_valid': is_valid,
+                            'confidence_score': combined_confidence,
+                            'method': f"{engine_name.lower()}_{method}_attempt{attempt+1}"
+                        }
+                        all_results.append(result)
     
     if not all_results:
         print(f"  ❌ No valid OCR results")
@@ -154,7 +237,12 @@ def recognize_plate_with_voting(plate_img, num_attempts=3):
 
 def visualize_results(image, plates_data, output_path='result.png'):
     """Create visualization with detection and OCR results"""
-    fig = plt.figure(figsize=(20, 12))
+    # Calculate grid size based on number of preprocessing methods
+    num_methods = len(plates_data[0]['processed_images']) if plates_data else 5
+    cols = 4
+    rows = 2 + (num_methods + 2) // cols  # +2 for original and cropped
+    
+    fig = plt.figure(figsize=(20, 6 * rows))
     
     # Original image with bbox
     plt.subplot(2, 4, 1)
@@ -175,11 +263,8 @@ def visualize_results(image, plates_data, output_path='result.png'):
     # Process each plate
     plot_idx = 2
     for i, data in enumerate(plates_data):
-        if plot_idx > 8:
-            break
-        
         # Cropped plate
-        plt.subplot(2, 4, plot_idx)
+        plt.subplot(rows, cols, plot_idx)
         plt.imshow(cv2.cvtColor(data['plate_img'], cv2.COLOR_BGR2RGB))
         title = f"Plate {i+1} - Original Crop"
         if data['plate_text']:
@@ -188,15 +273,15 @@ def visualize_results(image, plates_data, output_path='result.png'):
         plt.axis('off')
         plot_idx += 1
         
-        # Show preprocessed versions (max 3)
+        # Show ALL preprocessed versions
         if data['processed_images']:
-            for j, processed in enumerate(data['processed_images'][:3]):
-                if plot_idx > 8:
-                    break
+            for item in data['processed_images']:
+                processed = item['image']
+                method = item['method']
                 
-                plt.subplot(2, 4, plot_idx)
+                plt.subplot(rows, cols, plot_idx)
                 plt.imshow(processed, cmap='gray')
-                plt.title(f'Preprocess v{j}', fontsize=11)
+                plt.title(f'Preprocess {method}', fontsize=11)
                 plt.axis('off')
                 plot_idx += 1
     
